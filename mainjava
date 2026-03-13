@@ -1,0 +1,270 @@
+import java.nio.charset.StandardCharsets;
+
+/**
+ * HyperLogLog Algoritması — Benzersiz Eleman Sayısı (Cardinality) Yaklaşımı
+ *
+ * Beklenen hata payı formülü: σ ≈ 1.04 / √m
+ * b=10 kullanıldığında -> m=1024 bölme -> sapma yaklaşık %3.25
+ * b=12 kullanıldığında -> m=4096 bölme -> sapma yaklaşık %1.63
+ * b=14 kullanıldığında -> m=16384 bölme -> sapma yaklaşık %0.81
+ * b=16 kullanıldığında -> m=65536 bölme -> sapma yaklaşık %0.41
+ *
+ * Temel alınan literatür: Flajolet ve diğerleri, "HyperLogLog: the analysis of a near-optimal
+ * cardinality estimation algorithm", DMTCS 2007.
+ */
+class HyperLogLog {
+
+    private static final long TWO_32 = 1L << 32; // 32 bitlik maksimum aralık (4294967296)
+
+    private final int b;         // İndeksleme için ayrılan bit uzunluğu (4 ile 16 arası)
+    private final int m;         // Toplam saklama alanı (bucket) kapasitesi (2^b)
+    private final byte[] registers; // Her bir bölmede karşılaşılan en yüksek 1 bit pozisyonu
+    private final double alphaM;    // Hesaptaki kaymayı (bias) önlemek için kullanılan katsayı
+
+    // =========================================================================
+    // Sınıf Başlatıcı (Constructor) Metot
+    // =========================================================================
+
+    public HyperLogLog(int b) {
+        if (b < 4 || b > 16) {
+            throw new IllegalArgumentException(
+                    "b değeri 4 ile 16 arasında olmalıdır, verildi: " + b);
+        }
+        this.b = b;
+        this.m = 1 << b;                  // Bölme sayısını hesapla (2^b)
+        this.registers = new byte[m];     // Bellek dizisini oluştur (varsayılan olarak 0'larla dolar)
+        this.alphaM = computeAlpha(m);
+    }
+
+    // =========================================================================
+    // Düzeltme Katsayısı (Alpha) Hesaplaması
+    // =========================================================================
+
+    private static double computeAlpha(int m) {
+        switch (m) {
+            case 16:  return 0.673;
+            case 32:  return 0.697;
+            case 64:  return 0.709;
+            default:  return 0.7213 / (1.0 + 1.079 / m);
+        }
+    }
+
+    // =========================================================================
+    // Karma (Hash) Mekanizması — MurmurHash3 Entegrasyonu
+    //
+    // Standart veya basit hash fonksiyonları, benzer veya kısa metinlerde bitleri
+    // yeterince iyi dağıtamayabilir. MurmurHash3 algoritması girdileri 32-bitlik
+    // uzaya çok daha homojen ve düzgün bir şekilde yaydığı için tercih edilmiştir.
+    // =========================================================================
+
+    private static int murmurHash3Mix(int key) {
+        // Avalanche (çığ) etkisini artırarak bitlerin daha iyi karışmasını sağlayan adım
+        key ^= (key >>> 16);
+        key *= 0x85ebca6b;
+        key ^= (key >>> 13);
+        key *= 0xc2b2ae35;
+        key ^= (key >>> 16);
+        return key;
+    }
+
+    /**
+     * Gelen metin verisini 32-bitlik bir tam sayıya çeviren ana karma metodu.
+     * Önce FNV-1a algoritmasıyla baytlar işlenir, son aşamada MurmurHash3 uygulanır.
+     */
+    private int hash(String item) {
+        byte[] bytes = item.getBytes(StandardCharsets.UTF_8);
+        int h = 0x811c9dc5; // Başlangıç FNV değeri
+        for (byte b : bytes) {
+            h ^= (b & 0xFF);
+            h *= 0x01000193; // FNV çarpanı
+        }
+        return murmurHash3Mix(h); // Nihai homojen dağılımı elde et
+    }
+
+    // =========================================================================
+    // İlk '1' Bitinin Konumu (rho - ρ)
+    //   w içindeki en soldan (MSB) ilk 1 bitinin bulunduğu sırayı döndürür.
+    //   Hesaplama 1'den başlar (1-based index).
+    //   Eğer w tamamen sıfırlardan oluşuyorsa teorik maksimum değer döner.
+    // =========================================================================
+
+    private int rho(int w) {
+        // Başlangıçtaki ardışık sıfırların sayısını buluyoruz.
+        int leading = Integer.numberOfLeadingZeros(w);
+        int rhoVal  = leading + 1;
+        int maxRho  = 32 - b + 1; // Çıkılabilecek en yüksek pozisyon sınırı
+        return Math.min(rhoVal, maxRho);
+    }
+
+    // =========================================================================
+    // Kümeye Yeni Veri İlave Etme (Add)
+    // =========================================================================
+
+    public void add(String item) {
+        int hashVal = hash(item);
+
+        // Hash değerinin en solundaki 'b' adet bit, kaydın yerleşeceği indeksi belirler.
+        // İşaretsiz kaydırma (>>>) ve maskeleme (&) ile negatif indeks hataları önlenir.
+        int bucketIndex = (hashVal >>> (32 - b)) & (m - 1);
+
+        // Geriye kalan sağdaki bitler (32-b) ise kalıp (w) olarak ayrılır.
+        int w = hashVal << b;
+
+        int rhoVal = rho(w);
+
+        // Java'da byte veri tipi işaretli (-128 ile 127) olduğu için
+        // 0xFF maskesi ile işaretsiz değere dönüştürüp okuma yapıyoruz.
+        int current = registers[bucketIndex] & 0xFF;
+
+        // Eğer hesaplanan yeni pozisyon mevcut olandan daha ilerideyse, kaydı güncelle.
+        if (rhoVal > current) {
+            registers[bucketIndex] = (byte) rhoVal;
+        }
+    }
+
+    // =========================================================================
+    // Benzersiz Öğe Sayısını Bulma (Count)
+    //   1. Standart hesaplama: Harmonik ortalama üzerinden formülizasyon.
+    //   2. LinearCounting müdahalesi: Sonuç düşükse ve boş bölmeler mevcutsa uygulanır.
+    //   3. Üst sınır düzeltmesi: Çok yüksek değerli tahminlerdeki taşmaları dengeler.
+    // =========================================================================
+
+    public long count() {
+        // Harmonik ortalama için paydanın (Z) hesaplanması
+        double z = 0.0;
+        for (int i = 0; i < m; i++) {
+            z += Math.pow(2.0, -(registers[i] & 0xFF)); // Değerler işaretsiz okunmalı
+        }
+
+        // Öncelikli ham yaklaşım
+        double e = alphaM * (double) m * (double) m / z;
+
+        // --- Veri setinin küçük olduğu durumlardaki sapma düzeltmesi ---
+        if (e <= 2.5 * m) {
+            int v = 0; // İçinde veri olmayan bölme sayısı
+            for (int i = 0; i < m; i++) {
+                if (registers[i] == 0) v++;
+            }
+            if (v > 0) {
+                // Boşluk varsa LinearCounting formülü daha kesin sonuç verir.
+                return (long) (m * Math.log((double) m / v));
+            }
+            // Tüm bölmeler doluysa standart hesaplamayı baz al.
+            return (long) e;
+        }
+
+        // --- Veri setinin devasa olduğu (taşma ihtimali) durumlar ---
+        if (e > TWO_32 / 30.0) {
+            // Büyük ölçekli setlerdeki yaklaşım düzeltmesi
+            return (long) (-TWO_32 * Math.log(1.0 - e / TWO_32));
+        }
+
+        // --- Normal koşullar altında ham sonuç doğrudan döner ---
+        return (long) e;
+    }
+
+    // =========================================================================
+    // Kümelerin Birleşimi (Merge - Union)
+    //   İki farklı HLL nesnesini kayıpsız bir şekilde tek bir yapıda toplar.
+    //   Her iki nesnenin aynı indeksteki bölmeleri karşılaştırılarak en yüksek değer seçilir.
+    // =========================================================================
+
+    public HyperLogLog merge(HyperLogLog other) {
+        if (this.b != other.b) {
+            throw new IllegalArgumentException(
+                    "Birleştirilecek HLL yapıları aynı b değerine sahip olmalıdır. " +
+                            "this.b=" + this.b + ", other.b=" + other.b);
+        }
+        HyperLogLog merged = new HyperLogLog(this.b);
+        for (int i = 0; i < m; i++) {
+            // İki kaynaktan da veriyi çekip en büyüğünü yeni yapıya yazdırıyoruz
+            int a = this.registers[i]  & 0xFF;
+            int o = other.registers[i] & 0xFF;
+            merged.registers[i] = (byte) Math.max(a, o);
+        }
+        return merged;
+    }
+
+    // =========================================================================
+    // Matematiksel hata oranını döndüren yardımcı fonksiyon
+    // =========================================================================
+
+    public double theoreticalError() {
+        return 1.04 / Math.sqrt(m);
+    }
+
+    // =========================================================================
+    // Sınıfın metin temsili (toString overriding)
+    // =========================================================================
+
+    @Override
+    public String toString() {
+        return String.format(
+                "HyperLogLog{b=%d, m=%d, tahminiKardinality=%d, teorikHata=%.2f%%}",
+                b, m, count(), theoreticalError() * 100);
+    }
+
+    // =========================================================================
+    // Ana Metot — Uygulamanın çalıştırılması ve senaryoların test edilmesi
+    // =========================================================================
+
+    public static void main(String[] args) {
+
+        System.out.println("=== HyperLogLog Test ===\n");
+
+        // ---- 1. Aşama: Basit verilerle ekleme ve okuma işlemleri ----
+        System.out.println("-- Test 1: Temel ekleme --");
+        HyperLogLog hll = new HyperLogLog(10); // m=1024, ~%3.25 hata
+        String[] meyveler = {"elma", "armut", "muz", "elma", "kivi", "elma", "armut"};
+        for (String m : meyveler) hll.add(m);
+        System.out.println("Gerçek tekil eleman : 4");
+        System.out.println("HLL tahmini         : " + hll.count());
+        System.out.println(hll);
+
+        // ---- 2. Aşama: Yüksek hacimli veri yükleme denemesi ----
+        System.out.println("\n-- Test 2: Büyük veri seti (N=100_000) --");
+        HyperLogLog hll2 = new HyperLogLog(14); // m=16384, ~%0.81 hata
+        int N = 100_000;
+        for (int i = 0; i < N; i++) {
+            hll2.add("kullanici_" + i);
+        }
+        long tahmin2 = hll2.count();
+        double hata2 = Math.abs(tahmin2 - N) * 100.0 / N;
+        System.out.printf("Gerçek sayı  : %,d%n", N);
+        System.out.printf("HLL tahmini  : %,d%n", tahmin2);
+        System.out.printf("Gerçek hata  : %.2f%%%n", hata2);
+        System.out.printf("Teorik hata  : %.2f%%%n", hll2.theoreticalError() * 100);
+
+        // ---- 3. Aşama: İki farklı kümenin harmonizasyonu (Merge testi) ----
+        System.out.println("\n-- Test 3: merge() -- A ∪ B tahmini --");
+        HyperLogLog hllA = new HyperLogLog(12);
+        HyperLogLog hllB = new HyperLogLog(12);
+
+        // A kümesinin doldurulması: 0 ile 49.999 arası
+        for (int i = 0;      i < 50_000; i++) hllA.add("kullanici_" + i);
+        // B kümesinin doldurulması: 25.000 ile 74.999 arası (arada kesişen veriler var)
+        for (int i = 25_000; i < 75_000; i++) hllB.add("kullanici_" + i);
+
+        HyperLogLog hllMerged = hllA.merge(hllB);
+        int gercekBirlesen = 75_000; // Sonuçta 75.000 adet eşsiz veri olmalı
+
+        System.out.println("Gerçek |A ∪ B|    : " + gercekBirlesen);
+        System.out.println("|A| tahmini        : " + hllA.count());
+        System.out.println("|B| tahmini        : " + hllB.count());
+        System.out.println("|A ∪ B| tahmini    : " + hllMerged.count());
+
+        // ---- 4. Aşama: Değişen bit sayılarıyla (b) hata payı ilişkisi ----
+        System.out.println("\n-- Test 4: b (kova bit sayısı) artınca hata azalır --");
+        System.out.printf("%-5s %-8s %-16s %-12s%n", "b", "m", "Teorik σ (%)", "Gerçek hata (%)");
+        System.out.println("-".repeat(50));
+        int nTest = 50_000;
+        for (int bVal = 4; bVal <= 16; bVal += 2) {
+            HyperLogLog h = new HyperLogLog(bVal);
+            for (int i = 0; i < nTest; i++) h.add("item_" + i);
+            long est = h.count();
+            double errPct = Math.abs(est - nTest) * 100.0 / nTest;
+            System.out.printf("%-5d %-8d %-16.2f %-12.2f%n",
+                    bVal, 1 << bVal, h.theoreticalError() * 100, errPct);
+        }
+    }
+}
